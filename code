@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""
+tiktok_generator.py
+Single-script pipeline:
+  1) fetch quote from Quotable
+  2) generate image with diffusers (Stable Diffusion)
+  3) generate TTS narration with gTTS
+  4) assemble vertical video 1080x1920 with simple Ken Burns + subtitles
+  5) export mp4 TikTok-ready
+
+Requirements:
+  pip install requests moviepy gTTS diffusers transformers accelerate safetensors ftfy
+  (and torch appropriate for your GPU/CPU)
+  
+  Also: set HF_TOKEN environment variable if model requires authentication:
+    export HF_TOKEN="your_hf_token_here"
+
+Run:
+  python tiktok_generator.py
+"""
+
+import os
+import sys
+import time
+from datetime import datetime
+import requests
+from gtts import gTTS
+from moviepy.editor import (
+    ImageClip, AudioFileClip, CompositeVideoClip, TextClip, concatenate_videoclips
+)
+
+# Diffusers imports
+import torch
+from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler
+
+# ---------- Configuration ----------
+OUTPUT_DIR = "output"
+IMG_PATH = os.path.join(OUTPUT_DIR, "gen_image.png")
+VOICE_PATH = os.path.join(OUTPUT_DIR, "voice.mp3")
+VIDEO_PATH = os.path.join(OUTPUT_DIR, "tiktok_video.mp4")
+
+# Video settings
+WIDTH = 1080
+HEIGHT = 1920
+FPS = 30
+DURATION = 12  # seconds (adjust as needed; short is better for TikTok)
+TEXT_FONT = "Arial-Bold"  # change if font unavailable
+FONT_SIZE = 72
+SUBTITLE_MAX_WIDTH = WIDTH - 160
+
+# Diffusion settings
+MODEL_ID = "runwayml/stable-diffusion-v1-5"  # change if you want another
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+GUIDANCE_SCALE = 7.5
+NUM_INFERENCE_STEPS = 20
+SEED = None  # set to int for reproducible results
+
+# TTS settings
+TTS_LANG = "en"
+
+# ---------- Helpers ----------
+def ensure_output_dir():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def fetch_quote():
+    """Fetch a random quote from Quotable."""
+    r = requests.get("https://api.quotable.io/random", timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    # We'll use content + author
+    quote = data.get("content", "").strip()
+    author = data.get("author", "").strip()
+    full_text = f"{quote}\n— {author}" if author else quote
+    print("Fetched quote:", full_text.replace("\n", " | "))
+    return quote, author, full_text
+
+def build_prompt_from_quote(quote, author):
+    """Create an SD prompt from the quote for evocative imagery.
+       You can tune this to bias toward certain styles (cinematic, surreal, watercolor, neon, etc.)
+    """
+    # Basic prompt: combine quote concepts with style hints
+    # Keep it concise — Stable Diffusion works better with concrete visual descriptors
+    style = "cinematic, ultra-detailed, 8k, epic lighting, dramatic composition, bokeh"
+    # If quote is short, repeat some keywords (simple heuristic)
+    prompt = f"{quote}. An illustrative, {style}. vertical composition, full body framed, high detail"
+    # Optionally include author as attribution in prompt
+    if author:
+        prompt += f", subtle text overlay area at bottom for attribution"
+    # Avoid using punctuation that might mess up tokenization too much
+    return prompt
+
+def init_pipeline(model_id=MODEL_ID, device=DEVICE):
+    """Load Stable Diffusion pipeline (SLOW on first run)."""
+    hf_token = os.environ.get("HF_TOKEN", None)
+    print(f"Loading Stable Diffusion model '{model_id}' to {device} ...")
+    pipe = StableDiffusionPipeline.from_pretrained(
+        model_id,
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        use_safetensors=True if "safetensors" in sys.modules else False,
+        revision="fp16" if device == "cuda" else None,
+        safety_checker=None, # optional: add safety checker per your needs
+    )
+    # Use a faster scheduler
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    if device == "cuda":
+        pipe = pipe.to("cuda")
+    else:
+        pipe = pipe.to("cpu")
+    pipe.enable_attention_slicing()
+    return pipe
+
+def generate_image(pipe, prompt, out_path=IMG_PATH, width=WIDTH, height=HEIGHT, seed=SEED):
+    """Generate an image using the pipeline. Uses vertical aspect ratio (1080x1920)."""
+    generator = torch.Generator(device=DEVICE)
+    if seed is None:
+        # random seed
+        seed = int.from_bytes(os.urandom(2), "big")
+    generator.manual_seed(seed)
+    print(f"Generating image with seed {seed} ... Prompt length: {len(prompt)}")
+    # Stable Diffusion by default uses square sizes; we can pass height/width
+    with torch.autocast(device) if DEVICE == "cuda" else torch.cpu.amp.autocast(enabled=False):
+        image = pipe(
+            prompt,
+            guidance_scale=GUIDANCE_SCALE,
+            num_inference_steps=NUM_INFERENCE_STEPS,
+            height=height,
+            width=width,
+            generator=generator,
+        ).images[0]
+    image.save(out_path)
+    print("Saved generated image to", out_path)
+    return out_path, seed
+
+def make_tts(text, out_path=VOICE_PATH, lang=TTS_LANG):
+    """Make TTS audio using gTTS (simple and free)."""
+    print("Generating TTS audio...")
+    tts = gTTS(text=text, lang=lang)
+    tts.save(out_path)
+    print("Saved TTS to", out_path)
+    return out_path
+
+def make_video(image_path, audio_path, text_for_subs, out_path=VIDEO_PATH,
+               duration=DURATION, width=WIDTH, height=HEIGHT, fps=FPS):
+    """Assemble video: simple Ken Burns zoom + subtitles."""
+    print("Assembling video...")
+    # Load image as clip
+    img_clip = ImageClip(image_path)
+    # Ensure we fit the vertical canvas; center crop or pad if necessary
+    img_clip = img_clip.set_duration(duration).resize(width=width)
+    # If resized height < required, we can crop or add black bars; here we crop center
+    if img_clip.h < height:
+        # enlarge to cover height
+        scale = height / img_clip.h
+        img_clip = img_clip.resize(scale)
+    # Now crop center to exact height
+    img_clip = img_clip.crop(x_center=img_clip.w / 2, y_center=img_clip.h / 2, width=width, height=height)
+
+    # Ken Burns: zoom from 1.08 -> 1.0 (subtle inward)
+    def zoom(t):
+        # simple linear zoom factor
+        start = 1.08
+        end = 1.0
+        return start + (end - start) * (t / duration)
+
+    animated = img_clip.fl_time(lambda t: t)  # keep time mapping
+    animated = img_clip.resize(lambda t: zoom(t))
+
+    # Add audio
+    audio = AudioFileClip(audio_path)
+    # Optionally extend or trim image duration to audio duration (we'll use min(audio.duration, duration))
+    final_dur = min(duration, audio.duration)
+    animated = animated.set_duration(final_dur)
+    audio = audio.set_duration(final_dur)
+
+    # Subtitles: wrap the text and show at bottom
+    # moviepy's TextClip with method="caption" helps auto-wrap if size is set
+    subtitle = TextClip(
+        txt=text_for_subs,
+        fontsize=FONT_SIZE,
+        font=TEXT_FONT if TEXT_FONT else None,
+        method="caption",
+        size=(SUBTITLE_MAX_WIDTH, None),
+        align="center"
+    ).set_position(("center", height - 260)).set_duration(final_dur)
+
+    # small semi-opaque box behind text for readability
+    # We can make a semi-transparent image clip as background for the subtitle
+    from moviepy.video.tools.drawing import color_gradient
+    # Instead of gradient, create a Rect with opacity by using ImageClip filled with black and alpha
+    box_h = subtitle.h + 40
+    box_w = subtitle.w + 80
+    # create a black box with alpha by making a single-color clip and setting opacity
+    from moviepy.video.VideoClip import ColorClip
+    box_clip = ColorClip(size=(box_w, box_h), color=(0,0,0)).set_opacity(0.45)
+    box_clip = box_clip.set_position(("center", height - 260 - 20)).set_duration(final_dur)
+
+    # Attribution small text (optional)
+    # Combine clips
+    video = CompositeVideoClip([animated, box_clip, subtitle])
+    video = video.set_audio(audio)
+    # final write
+    print("Rendering video (this may take a while)...")
+    video.write_videofile(out_path, fps=fps, codec="libx264", audio_codec="aac", threads=4, preset="medium")
+    print("Saved video to", out_path)
+    return out_path
+
+# ---------- Main pipeline ----------
+def main():
+    ensure_output_dir()
+    quote, author, full_text = fetch_quote()
+    prompt = build_prompt_from_quote(quote, author)
+    print("Prompt for image generation:", prompt[:200] + ("..." if len(prompt)>200 else ""))
+
+    # init pipeline
+    pipe = init_pipeline()
+
+    # generate image
+    try:
+        img_path, used_seed = generate_image(pipe, prompt)
+    except Exception as e:
+        print("Error during image generation:", e)
+        print("You can fallback to a stock background 'background.jpg' named in output/ and re-run.")
+        # Re-raise to stop or fallback - here we'll abort
+        raise
+
+    # generate TTS: for narration, use just the quote + author
+    narration_text = full_text
+    make_tts(narration_text)
+
+    # assemble video
+    # For subtitles we may prefer shorter lines: use the full_text
+    video_out = make_video(img_path, VOICE_PATH, text_for_subs=full_text)
+
+    print("Pipeline completed.")
+    print("Files created:")
+    print(" - Image:", img_path)
+    print(" - Voice:", VOICE_PATH)
+    print(" - Video:", video_out)
+    print("Seed used for reproducibility:", used_seed)
+
+if __name__ == "__main__":
+    main()
